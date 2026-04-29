@@ -1,0 +1,82 @@
+name: Intraday Trading Bot — ORB
+
+# -----------------------------------------------------------------------
+# MANUAL TRIGGER — click "Run workflow" each morning at 09:10 IST.
+#
+#   09:10 IST trigger + 6-hour GitHub hard cap = 15:10 IST.
+#   The bot waits internally until 09:20 IST before trading starts,
+#   then squares off all positions at 15:10 IST automatically.
+#
+# STRATEGY: ORB (Opening Range Breakout) with NIFTY Regime Filter
+#   • Universe   : 32 stocks (top 15/day by ATR%)
+#   • Position   : Rs 2,25,000 per trade (1.5× base, up to 5 simultaneous)
+#   • Entry window: 09:30 – 11:00 IST
+#   • NIFTY BULL → LONG breakouts only
+#   • NIFTY BEAR → SHORT breakdowns only
+#   • NIFTY NEUTRAL → both directions
+#
+# HOW TO START EACH MORNING:
+#   GitHub → Actions tab → "Intraday Trading Bot — ORB" → "Run workflow"
+#   (no inputs required — just click the green button at 09:10 IST)
+# -----------------------------------------------------------------------
+
+on:
+  workflow_dispatch:    # One-click manual trigger — no inputs needed
+
+# Only one run at a time. If triggered twice, the second run is cancelled.
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false   # Keep the already-running bot; cancel the duplicate
+
+# Write access so the bot can push performance logs back after each session.
+permissions:
+  contents: write
+
+jobs:
+  trade:
+    name: ORB Strategy — Live Trading
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    timeout-minutes: 360    # GitHub hard cap is 6 hours — trigger at 09:10 IST to cover until 15:10 IST
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ORB strategy
+        env:
+          STOCKSDEVELOPER_API_KEY: ${{ secrets.STOCKSDEVELOPER_API_KEY }}
+          STOCKSDEVELOPER_ACCOUNT: ${{ secrets.STOCKSDEVELOPER_ACCOUNT }}
+          ACTIVE_STRATEGY: "ORB"
+        run: |
+          echo "======================================"
+          echo "  ORB Bot — $(date +'%Y-%m-%d %H:%M')"
+          echo "  NIFTY Regime Filter: ON"
+          echo "  Universe: 32 stocks, top 15 by ATR%"
+          echo "  Position: Rs2,25,000 (1.5× × Rs1,50,000)"
+          echo "  Max positions: 5"
+          echo "  Entry window: 09:30 – 11:00 IST"
+          echo "  Square-off: 15:10 IST"
+          echo "======================================"
+          python main.py --strategy ORB
+
+      - name: Save performance log to repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add performance_log_ORB.csv 2>/dev/null || true
+          git diff --staged --quiet \
+            && echo "No new trades to commit." \
+            || git commit -m "perf: ORB trading log $(date -u '+%Y-%m-%d')" \
+            && git push origin HEAD:${{ github.ref_name }}
