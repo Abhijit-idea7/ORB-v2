@@ -30,6 +30,7 @@ from config import (
     ORB_MAX_POSITIONS,
     REGIME_BEAR_MAX_POSITIONS,
     REGIME_BEAR_THRESHOLD,
+    REGIME_BULL_MAX_POSITIONS,
     REGIME_BULL_THRESHOLD,
     REGIME_NEUTRAL_MAX_POSITIONS,
 )
@@ -124,7 +125,7 @@ def get_nifty_regime() -> dict:
             result = {
                 "regime":           "BULL",
                 "score":            score,
-                "max_positions":    ORB_MAX_POSITIONS,
+                "max_positions":    REGIME_BULL_MAX_POSITIONS,
                 "direction_filter": "LONG_ONLY",
             }
         elif score < REGIME_BEAR_THRESHOLD:

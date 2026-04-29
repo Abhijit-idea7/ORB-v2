@@ -56,6 +56,7 @@ from config import (
     ORB_MIN_GAP_PCT,
     ORB_MIN_RANGE_PCT,
     ORB_POSITION_SCALE,
+    ORB_SECONDARY_WINDOW_ENABLED,
     ORB_TARGET_MULTIPLIER,
     ORB_VOLUME_MULT_SECONDARY,
     ORB_VOLUME_MULTIPLIER,
@@ -274,19 +275,22 @@ def generate_signal(df: pd.DataFrame, symbol: str = "", sim_time=None) -> dict:
     if signal["action"] in ("BUY", "SELL"):
         return signal
 
-    # --- Secondary window (30-min ORB) ---
-    signal = _check_orb_window(
-        row,
-        cutoff_time=ORB_ENTRY_CUTOFF_SECONDARY,
-        orb_high_key=ORB_HIGH_30_COL,
-        orb_low_key=ORB_LOW_30_COL,
-        orb_est_key=ORB_EST_30_COL,
-        vol_multiplier=ORB_VOLUME_MULT_SECONDARY,
-        chase_limit=ORB_CHASE_LIMIT_SECONDARY,
-        window_label="30m",
-        **common,
-    )
-    return signal
+    # --- Secondary window (30-min ORB) — only if enabled in config ---
+    if ORB_SECONDARY_WINDOW_ENABLED:
+        signal = _check_orb_window(
+            row,
+            cutoff_time=ORB_ENTRY_CUTOFF_SECONDARY,
+            orb_high_key=ORB_HIGH_30_COL,
+            orb_low_key=ORB_LOW_30_COL,
+            orb_est_key=ORB_EST_30_COL,
+            vol_multiplier=ORB_VOLUME_MULT_SECONDARY,
+            chase_limit=ORB_CHASE_LIMIT_SECONDARY,
+            window_label="30m",
+            **common,
+        )
+        return signal
+
+    return _HOLD
 
 
 def check_exit_signal(df: pd.DataFrame, position: dict) -> str | None:

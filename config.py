@@ -92,8 +92,12 @@ ORB_CHASE_LIMIT_PCT     = float(os.getenv("ORB_CHASE_LIMIT_PCT",   "0.010"))
 # Max extension beyond ORB level before entry blocked.
 # Relaxed from 0.8% → 1.0% — captures breakouts that extend slightly further.
 
-ORB_TARGET_MULTIPLIER   = float(os.getenv("ORB_TARGET_MULTIPLIER", "2.5"))
-# Target = entry ± (ORB range × 2.5). Profitable at 40% win rate.
+ORB_TARGET_MULTIPLIER   = float(os.getenv("ORB_TARGET_MULTIPLIER", "1.5"))
+# Target = entry ± (ORB range × 1.5).
+# Reduced from 2.5 → 1.5: backtest showed only 5.6% of trades reached 2.5× target,
+# while 54% were force-closed at square-off time (price moved right direction but
+# didn't travel far enough). At 1.5× far more trades complete as TARGET hits.
+# Still profitable at 48% win rate with 1.5:1 R:R.
 
 ORB_ENTRY_CUTOFF_TIME   = os.getenv("ORB_ENTRY_CUTOFF_TIME",       "11:00")
 # Primary ORB entries cut off at 11:00 IST (90-min window after ORB establishes).
@@ -105,8 +109,10 @@ ORB_POSITION_SCALE      = float(os.getenv("ORB_POSITION_SCALE",    "1.0"))
 # Capital scale per trade. 1.0 = Rs150,000 per trade.
 # With 10 max positions: Rs150k × 10 = Rs1.5M max deployment.
 
-ORB_FAILED_BUFFER_PCT   = float(os.getenv("ORB_FAILED_BUFFER_PCT", "0.008"))
-# 0.8% close back inside the range triggers ORB_FAILED exit.
+ORB_FAILED_BUFFER_PCT   = float(os.getenv("ORB_FAILED_BUFFER_PCT", "0.005"))
+# 0.5% close back inside range triggers ORB_FAILED exit.
+# Tightened from 0.8% → 0.5%: cuts failing breakouts faster, reducing loss
+# per failed trade. ORB_FAILED is the cleanest exit type — trigger it sooner.
 
 ORB_BREAKEVEN_TRIGGER_R = float(os.getenv("ORB_BREAKEVEN_TRIGGER_R", "0.5"))
 # Move SL to breakeven once trade gains 50% of initial risk.
@@ -115,20 +121,16 @@ ORB_BREAKEVEN_TRIGGER_R = float(os.getenv("ORB_BREAKEVEN_TRIGGER_R", "0.5"))
 # ---------------------------------------------------------------------------
 # Secondary ORB Parameters (30-min window: 9:15–9:45 IST)
 # ---------------------------------------------------------------------------
-# Captures stocks that consolidate longer before breaking out.
-# These "slow starters" miss the 15-min ORB but break cleanly on the wider range.
-# ---------------------------------------------------------------------------
+ORB_SECONDARY_WINDOW_ENABLED = False
+# DISABLED: backtest showed 30-min ORB had 36% win rate vs 50% for 15-min,
+# producing net -Rs6,887 on 14 trades over 30 days. The wider range creates
+# looser setups with lower conviction. Re-enable via env var if desired.
+# Override: ORB_SECONDARY_WINDOW_ENABLED=true in .env
+
 ORB_MINUTES_SECONDARY       = int(os.getenv("ORB_MINUTES_SECONDARY",       "30"))
-# Extended range: first 30 min of NSE session (9:15–9:45 IST).
-
 ORB_ENTRY_CUTOFF_SECONDARY  = os.getenv("ORB_ENTRY_CUTOFF_SECONDARY",      "11:30")
-# Secondary window entries cut off at 11:30 IST.
-
 ORB_VOLUME_MULT_SECONDARY   = float(os.getenv("ORB_VOLUME_MULT_SECONDARY", "1.20"))
-# Slightly stricter volume for secondary window — wider range needs cleaner confirm.
-
 ORB_CHASE_LIMIT_SECONDARY   = float(os.getenv("ORB_CHASE_LIMIT_SECONDARY", "0.010"))
-# Same 1.0% chase limit for secondary breakouts.
 
 # ---------------------------------------------------------------------------
 # Position Management
@@ -172,8 +174,10 @@ LOOP_SLEEP_SECONDS  = 120       # Sleep between strategy iterations (2-min candl
 # ---------------------------------------------------------------------------
 REGIME_BULL_THRESHOLD        = 0.20
 REGIME_BEAR_THRESHOLD        = -0.20
-REGIME_BEAR_MAX_POSITIONS    = 5    # Halve positions in bear regime
-REGIME_NEUTRAL_MAX_POSITIONS = 8    # 80% of full positions in neutral
+REGIME_BULL_MAX_POSITIONS    = 5    # Capped: backtest BULL days earned Rs613/day vs
+                                    # BEAR days Rs3,366/day — BULL doesn't deserve full exposure
+REGIME_BEAR_MAX_POSITIONS    = 5    # Same cap as BULL — short setups are cleaner
+REGIME_NEUTRAL_MAX_POSITIONS = 5    # Conservative across all regimes
 
 # ---------------------------------------------------------------------------
 # Stocksdeveloper / Zerodha Webhook

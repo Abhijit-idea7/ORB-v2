@@ -577,10 +577,13 @@ def run(days: int, use_regime: bool = False) -> None:
 
         effective_max = ORB_MAX_POSITIONS
         if use_regime:
-            from config import REGIME_BEAR_MAX_POSITIONS, REGIME_NEUTRAL_MAX_POSITIONS
-            if regime_info.get("regime") == "BEAR":
+            from config import REGIME_BEAR_MAX_POSITIONS, REGIME_BULL_MAX_POSITIONS, REGIME_NEUTRAL_MAX_POSITIONS
+            regime_label_full = regime_info.get("regime", "NEUTRAL")
+            if regime_label_full == "BULL":
+                effective_max = REGIME_BULL_MAX_POSITIONS
+            elif regime_label_full == "BEAR":
                 effective_max = REGIME_BEAR_MAX_POSITIONS
-            elif regime_info.get("regime") == "NEUTRAL":
+            elif regime_label_full == "NEUTRAL":
                 effective_max = REGIME_NEUTRAL_MAX_POSITIONS
 
         candidates = rank_by_atr(symbol_dfs, date_, top_n=ORB_TOP_N_STOCKS)
