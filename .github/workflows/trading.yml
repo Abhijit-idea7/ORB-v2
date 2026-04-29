@@ -1,44 +1,42 @@
-name: Intraday Trading Bot — ORB
+name: ORB v2 — Dual-Window Trading Bot
 
 # -----------------------------------------------------------------------
 # MANUAL TRIGGER — click "Run workflow" each morning at 09:10 IST.
 #
 #   09:10 IST trigger + 6-hour GitHub hard cap = 15:10 IST.
-#   The bot waits internally until 09:20 IST before trading starts,
+#   The bot waits internally until 09:20 IST before entering trades,
 #   then squares off all positions at 15:10 IST automatically.
 #
-# STRATEGY: ORB (Opening Range Breakout) with NIFTY Regime Filter
-#   • Universe   : 32 stocks (top 15/day by ATR%)
-#   • Position   : Rs 2,25,000 per trade (1.5× base, up to 5 simultaneous)
-#   • Entry window: 09:30 – 11:00 IST
-#   • NIFTY BULL → LONG breakouts only
-#   • NIFTY BEAR → SHORT breakdowns only
-#   • NIFTY NEUTRAL → both directions
+# STRATEGY: Dual-Window ORB with NIFTY Regime Filter
+#   • Universe    : 55 stocks (top 25/day by ATR%)
+#   • Position    : Rs 1,50,000 per trade (up to 10 simultaneous)
+#   • Window 1    : 15-min ORB, entries 09:30 – 11:00 IST
+#   • Window 2    : 30-min ORB, entries 09:45 – 11:30 IST
+#   • NIFTY BULL  → LONG breakouts only (max 10 positions)
+#   • NIFTY BEAR  → SHORT breakdowns only (max 5 positions)
+#   • NIFTY NEUTRAL → both directions (max 8 positions)
 #
-# HOW TO START EACH MORNING:
-#   GitHub → Actions tab → "Intraday Trading Bot — ORB" → "Run workflow"
-#   (no inputs required — just click the green button at 09:10 IST)
+# HOW TO START:
+#   GitHub → Actions → "ORB v2 — Dual-Window Trading Bot" → "Run workflow"
 # -----------------------------------------------------------------------
 
 on:
-  workflow_dispatch:    # One-click manual trigger — no inputs needed
+  workflow_dispatch:
 
-# Only one run at a time. If triggered twice, the second run is cancelled.
 concurrency:
-  group: trading-bot
-  cancel-in-progress: false   # Keep the already-running bot; cancel the duplicate
+  group: orb-v2-trading-bot
+  cancel-in-progress: false
 
-# Write access so the bot can push performance logs back after each session.
 permissions:
   contents: write
 
 jobs:
   trade:
-    name: ORB Strategy — Live Trading
+    name: ORB v2 — Live Trading
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    timeout-minutes: 360    # GitHub hard cap is 6 hours — trigger at 09:10 IST to cover until 15:10 IST
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -53,22 +51,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run ORB strategy
+      - name: Run ORB v2 strategy
         env:
           STOCKSDEVELOPER_API_KEY: ${{ secrets.STOCKSDEVELOPER_API_KEY }}
           STOCKSDEVELOPER_ACCOUNT: ${{ secrets.STOCKSDEVELOPER_ACCOUNT }}
-          ACTIVE_STRATEGY: "ORB"
         run: |
-          echo "======================================"
-          echo "  ORB Bot — $(date +'%Y-%m-%d %H:%M')"
-          echo "  NIFTY Regime Filter: ON"
-          echo "  Universe: 32 stocks, top 15 by ATR%"
-          echo "  Position: Rs2,25,000 (1.5× × Rs1,50,000)"
-          echo "  Max positions: 5"
-          echo "  Entry window: 09:30 – 11:00 IST"
-          echo "  Square-off: 15:10 IST"
-          echo "======================================"
-          python main.py --strategy ORB
+          echo "============================================"
+          echo "  ORB v2 Bot — $(date +'%Y-%m-%d %H:%M')"
+          echo "  Universe : 55 stocks, top 25 by ATR%"
+          echo "  Positions: Rs1,50,000 each, max 10"
+          echo "  Window 1 : 15-min ORB → 11:00 IST"
+          echo "  Window 2 : 30-min ORB → 11:30 IST"
+          echo "  Regime   : NIFTY filter active"
+          echo "============================================"
+          python main.py
 
       - name: Save performance log to repo
         if: always()
@@ -78,5 +74,5 @@ jobs:
           git add performance_log_ORB.csv 2>/dev/null || true
           git diff --staged --quiet \
             && echo "No new trades to commit." \
-            || git commit -m "perf: ORB trading log $(date -u '+%Y-%m-%d')" \
+            || git commit -m "perf: ORB v2 trading log $(date -u '+%Y-%m-%d')" \
             && git push origin HEAD:${{ github.ref_name }}
