@@ -2,26 +2,24 @@
 """
 backtest.py
 -----------
-Offline backtest of the multi-strategy intraday bot over the last N trading days.
+Offline backtest of the dual-window ORB strategy over the last N trading days.
 
 Usage:
-    python backtest.py                        # ORB, 30 days
-    python backtest.py --strategy VWAP_EMA
-    python backtest.py --strategy COMBINED --days 45
-    python backtest.py --strategy ORB --days 15
+    python backtest.py                  # 30 days, regime filter OFF
+    python backtest.py --days 45
+    python backtest.py --days 30 --regime   # enable NIFTY regime filter
 
 How it works:
-  1. Fetches 59 days of 2-min candles from yfinance for all STOCK_UNIVERSE stocks
-     (maximum available; gives EMA/RSI full warmup history)
+  1. Fetches 59 days of 2-min candles from yfinance for all ORB_STOCK_UNIVERSE stocks
+     (maximum available from Yahoo Finance — gives EMA/RSI full warmup history)
   2. Computes all indicators once on the full dataset per symbol
   3. Simulates the live-bot loop day by day, candle by candle:
        - Ranks stocks daily by ATR% (same as live bot)
-       - Entries: checks each active strategy's generate_signal()
-       - Exits:   checks check_exit_signal() for the strategy that opened the trade
-       - Respects MAX_POSITIONS simultaneous open positions
+       - Checks 15-min ORB first, then 30-min ORB (same priority as live bot)
+       - Respects ORB_MAX_POSITIONS simultaneous open positions
        - Hard square-off at 15:15 IST
-  4. Prints per-day P&L table + overall summary
-  5. Saves all trades to backtest_results.csv (artifact in GitHub Actions)
+  4. Prints per-day P&L table with window breakdown (15m vs 30m)
+  5. Saves all trades to backtest_results.csv
 
 Note on yfinance data:
   Yahoo Finance provides up to ~59 days of 2-min candles.
@@ -31,7 +29,7 @@ Note on yfinance data:
 import argparse
 import csv
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from pathlib import Path
 
@@ -41,9 +39,7 @@ import pytz
 import yfinance as yf
 
 from config import (
-    ACTIVE_STRATEGY,
     DAILY_LOSS_CIRCUIT_BREAKER,
-    MAX_POSITIONS,
     ONE_TRADE_PER_STOCK_PER_DAY,
     ORB_MAX_POSITIONS,
     ORB_STOCK_UNIVERSE,
@@ -51,15 +47,10 @@ from config import (
     POSITION_SIZE_INR,
     REGIME_BEAR_THRESHOLD,
     REGIME_BULL_THRESHOLD,
-    STOCK_UNIVERSE,
-    TOP_N_STOCKS,
 )
 from indicators import add_indicators
-from strategy_factory import get_strategies, get_strategy_name
+from strategy_orb import check_exit_signal, generate_signal
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -72,11 +63,11 @@ TRADE_START  = time(9, 20)
 SQUARE_OFF   = time(15, 15)
 BROKERAGE    = 40         # Rs20 × 2 legs per trade (Zerodha intraday)
 OUTPUT_CSV   = Path("backtest_results.csv")
-NIFTY_TICKER = "^NSEI"   # NIFTY50 index — no .NS suffix
+NIFTY_TICKER = "^NSEI"
 
 CSV_FIELDS = [
-    "date", "symbol", "strategy", "direction",
-    "entry_time", "exit_time",
+    "date", "symbol", "window",
+    "direction", "entry_time", "exit_time",
     "entry_price", "exit_price",
     "quantity", "pnl_inr", "exit_reason",
 ]
@@ -87,21 +78,23 @@ CSV_FIELDS = [
 # ---------------------------------------------------------------------------
 @dataclass
 class BtPosition:
-    symbol:        str
-    direction:     str
-    entry_price:   float
-    sl:            float
-    target:        float
-    quantity:      int
-    entry_time:    str
-    strategy_name: str
+    symbol:             str
+    direction:          str
+    entry_price:        float
+    sl:                 float
+    target:             float
+    quantity:           int
+    entry_time:         str
+    strategy_name:      str = "ORB"
+    orb_breakout_level: float = 0.0
+    window:             str = "15m"
 
 
 @dataclass
 class BtTrade:
     date:        str
     symbol:      str
-    strategy:    str
+    window:      str
     direction:   str
     entry_time:  str
     exit_time:   str
@@ -151,19 +144,19 @@ def fetch_with_indicators(symbol: str) -> pd.DataFrame | None:
         return None
 
 
-def rank_by_atr(symbol_dfs: dict, date_: datetime.date, top_n: int = TOP_N_STOCKS) -> list[str]:
-    """Rank symbols by ATR% using daily data prior to backtest date."""
+def rank_by_atr(symbol_dfs: dict, date_: datetime.date, top_n: int = ORB_TOP_N_STOCKS) -> list[str]:
+    """Rank symbols by ATR% using daily data prior to the backtest date."""
     scores: dict[str, float] = {}
     for symbol, df in symbol_dfs.items():
         try:
             hist = df[df.index.date < date_]
             if hist.empty:
                 continue
-            daily       = hist["Close"].resample("1D").last().dropna()
-            daily_high  = hist["High"].resample("1D").max().dropna()
-            daily_low   = hist["Low"].resample("1D").min().dropna()
+            daily      = hist["Close"].resample("1D").last().dropna()
+            daily_high = hist["High"].resample("1D").max().dropna()
+            daily_low  = hist["Low"].resample("1D").min().dropna()
             daily, daily_high = daily.align(daily_high, join="inner")
-            daily, daily_low  = daily.align(daily_low, join="inner")
+            daily, daily_low  = daily.align(daily_low,  join="inner")
             if len(daily) < 3:
                 continue
             prev_close = daily.shift(1)
@@ -188,17 +181,12 @@ def calculate_quantity(price: float, scale: float = 1.0) -> int:
 
 
 # ---------------------------------------------------------------------------
-# NIFTY Regime helpers (used when ORB_REGIME_FILTER=true)
+# NIFTY Regime helpers
 # ---------------------------------------------------------------------------
-def fetch_nifty_with_indicators() -> "pd.DataFrame | None":
-    """
-    Fetch ~59 days of 2-min NIFTY50 candles with indicators computed.
-    Uses ^NSEI (Yahoo Finance index ticker — no .NS suffix).
-    """
+def fetch_nifty_with_indicators() -> pd.DataFrame | None:
     try:
         df = yf.Ticker(NIFTY_TICKER).history(interval="2m", period="59d")
         if df is None or df.empty:
-            logger.warning("NIFTY: empty response from yfinance")
             return None
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         df.index = pd.to_datetime(df.index)
@@ -207,7 +195,6 @@ def fetch_nifty_with_indicators() -> "pd.DataFrame | None":
         else:
             df.index = df.index.tz_convert(IST)
         if len(df) < 30:
-            logger.warning(f"NIFTY: only {len(df)} candles — too few")
             return None
         df = add_indicators(df)
         logger.info(f"NIFTY: {len(df)} candles fetched with indicators")
@@ -221,15 +208,11 @@ def compute_day_regime(nifty_df: pd.DataFrame, date_) -> dict:
     """
     Classify the NIFTY regime for a given backtest date using data up to 10:00 IST.
 
-    Using 10:00 cutoff simulates what the live bot would see before most ORB entries
-    (ORB_ENTRY_CUTOFF_TIME = 11:00). This avoids look-ahead bias while still giving
-    a clear regime signal from the first 45 minutes of trading.
+    Using 10:00 cutoff simulates what the live bot sees before most ORB entries
+    (primary cutoff 11:00, secondary 11:30). Avoids look-ahead bias.
 
     Scoring mirrors market_regime.py exactly:
-      VWAP position (0.40) + EMA 9 vs 50 trend (0.40) + Day change (0.20)
-      score > REGIME_BULL_THRESHOLD  → BULL  → LONG_ONLY
-      score < REGIME_BEAR_THRESHOLD  → BEAR  → SHORT_ONLY
-      else                           → NEUTRAL → BOTH
+      VWAP position (0.40) + EMA 9 vs 50 (0.40) + Day change (0.20)
     """
     _neutral = {"regime": "NEUTRAL", "score": 0.0, "direction_filter": "BOTH"}
 
@@ -238,34 +221,29 @@ def compute_day_regime(nifty_df: pd.DataFrame, date_) -> dict:
         if day_df.empty:
             return _neutral
 
-        # Use data up to 10:00 IST — enough time for regime to establish but
-        # well before the 11:00 ORB entry cutoff.
         cutoff_time = time(10, 0)
         day_df = day_df[day_df.index.time <= cutoff_time]
         if len(day_df) < 3:
             return _neutral
 
-        row   = day_df.iloc[-1]   # last candle on or before 10:00 IST
+        row   = day_df.iloc[-1]
         close = float(row["Close"])
 
-        components: list = []
-        weights:    list = []
+        components: list[float] = []
+        weights:    list[float] = []
 
-        # Component 1: VWAP position (weight 0.40)
         vwap = row.get("vwap")
         if not pd.isna(vwap) and float(vwap) > 0:
             vwap_dev = (close - float(vwap)) / float(vwap)
             components.append(float(np.tanh(vwap_dev * 100)))
             weights.append(0.40)
 
-        # Component 2: EMA 9 vs EMA 50 (weight 0.40)
         ema9  = row.get("ema_fast")
         ema50 = row.get("ema_macro")
         if not any(pd.isna(x) for x in (ema9, ema50)):
             components.append(1.0 if float(ema9) > float(ema50) else -1.0)
             weights.append(0.40)
 
-        # Component 3: Day change from open (weight 0.20)
         day_open = row.get("day_open")
         if not pd.isna(day_open) and float(day_open) > 0:
             day_chg = (close - float(day_open)) / float(day_open)
@@ -300,18 +278,17 @@ def simulate_day(
     date_:            datetime.date,
     candidates:       list[str],
     symbol_dfs:       dict,
-    strategies:       list,
-    max_positions:    int = MAX_POSITIONS,
+    max_positions:    int = ORB_MAX_POSITIONS,
     direction_filter: str = "BOTH",
 ) -> list[BtTrade]:
     """
-    Simulate a full trading day candle-by-candle across all candidates.
-    Returns a list of BtTrade records for all closed trades that day.
+    Simulate a full trading day candle-by-candle.
+    Returns a list of BtTrade records for all trades closed that day.
     """
-    trades: list[BtTrade]         = []
-    open_positions: dict[str, BtPosition] = {}
-    traded_today:   set[str]      = set()
-    daily_realized_pnl: float     = 0.0
+    trades:               list[BtTrade]           = []
+    open_positions:       dict[str, BtPosition]   = {}
+    traded_today:         set[str]                = set()
+    daily_realized_pnl:   float                   = 0.0
 
     # Build per-symbol DataFrames for this day
     day_data: dict[str, pd.DataFrame] = {}
@@ -326,7 +303,6 @@ def simulate_day(
     if not day_data:
         return trades
 
-    # Unified timeline across all symbols
     all_times = sorted({ts for df in day_data.values() for ts in df.index})
 
     def _close_position(symbol: str, exit_px: float, reason: str, ts_str: str):
@@ -342,7 +318,7 @@ def simulate_day(
         trades.append(BtTrade(
             date        = date_.isoformat(),
             symbol      = symbol,
-            strategy    = pos.strategy_name,
+            window      = pos.window,
             direction   = pos.direction,
             entry_time  = pos.entry_time,
             exit_time   = ts_str,
@@ -360,39 +336,31 @@ def simulate_day(
         # Hard square-off gate
         if ts_time >= SQUARE_OFF:
             for symbol in list(open_positions.keys()):
-                df     = day_data.get(symbol)
-                px     = float(df.loc[ts, "Close"]) if df is not None and ts in df.index else open_positions[symbol].entry_price
+                df = day_data.get(symbol)
+                px = (
+                    float(df.loc[ts, "Close"])
+                    if df is not None and ts in df.index
+                    else open_positions[symbol].entry_price
+                )
                 _close_position(symbol, px, "SQUARE_OFF", ts_str)
             break
 
         if ts_time < TRADE_START:
             continue
 
-        # --- Exit checks ---
-        # Bug fix #3: use df.index < ts (strictly less than) so the currently
-        # forming candle at `ts` is never included — only fully-closed bars.
+        # --- Exit checks (strictly closed candles only: df.index < ts) ---
         for symbol in list(open_positions.keys()):
             df = day_data.get(symbol)
             if df is None:
                 continue
-            pos = open_positions[symbol]
-            df_slice = df[df.index < ts]   # strictly less than → only closed candles
+            pos      = open_positions[symbol]
+            df_slice = df[df.index < ts]
             if len(df_slice) < 2:
                 continue
 
-            # Route exit check to the strategy that opened this position
-            strategy_module = next(
-                (s for s in strategies if get_strategy_name(s) == pos.strategy_name),
-                strategies[0],
-            )
-            reason = strategy_module.check_exit_signal(df_slice, pos.__dict__)
+            reason = check_exit_signal(df_slice, pos.__dict__)
             if reason:
-                # Exit price selection — match the detection method used in
-                # check_exit_signal so simulated P&L reflects real fills:
-                #   TARGET    → filled at the target level (High/Low touched it)
-                #   STOP_LOSS → filled at SL level (Low/High touched it)
-                #   ORB_FAILED / SQUARE_OFF / other → filled at Close
-                sig_candle = df_slice.iloc[-1]   # last closed candle (signal candle)
+                sig_candle = df_slice.iloc[-1]
                 if reason == "TARGET":
                     exit_px = float(pos.target)
                 elif reason == "STOP_LOSS":
@@ -402,11 +370,10 @@ def simulate_day(
                 _close_position(symbol, exit_px, reason, ts_str)
 
         # --- Entry checks ---
-        # Bug fix #3 (entry): same df_slice boundary — strictly less than ts.
         circuit_tripped = daily_realized_pnl <= DAILY_LOSS_CIRCUIT_BREAKER
         if len(open_positions) < max_positions and not circuit_tripped:
             for symbol in candidates:
-                if len(open_positions) >= max_positions:   # fixed: was MAX_POSITIONS
+                if len(open_positions) >= max_positions:
                     break
                 if symbol in open_positions:
                     continue
@@ -416,55 +383,39 @@ def simulate_day(
                 df = day_data.get(symbol)
                 if df is None:
                     continue
-
-                df_slice = df[df.index < ts]   # strictly less than → only closed candles
+                df_slice = df[df.index < ts]
                 if len(df_slice) < 3:
                     continue
 
-                # Try each strategy in order — take the first valid signal
-                for strategy_module in strategies:
-                    # Bug fix #1: pass sim_time=ts so the cutoff gate inside
-                    # generate_signal() uses the simulated candle time, not
-                    # datetime.now() (which would always be after market hours
-                    # and block every single signal during backtesting).
-                    signal = strategy_module.generate_signal(
-                        df_slice, symbol=symbol, sim_time=ts
-                    )
-                    if signal["action"] not in ("BUY", "SELL"):
-                        continue
+                # Pass sim_time=ts so the cutoff gate in generate_signal()
+                # uses the backtest candle time, not datetime.now().
+                signal = generate_signal(df_slice, symbol=symbol, sim_time=ts)
+                if signal["action"] not in ("BUY", "SELL"):
+                    continue
 
-                    # Regime direction filter: block counter-regime trades
-                    # BULL  → LONG_ONLY  → skip SELL signals
-                    # BEAR  → SHORT_ONLY → skip BUY signals
-                    # NEUTRAL → BOTH    → no restriction
-                    if direction_filter == "LONG_ONLY" and signal["action"] == "SELL":
-                        logger.info(f"{symbol} ORB: SELL blocked — BULL regime (LONG_ONLY)")
-                        continue
-                    if direction_filter == "SHORT_ONLY" and signal["action"] == "BUY":
-                        logger.info(f"{symbol} ORB: BUY blocked — BEAR regime (SHORT_ONLY)")
-                        continue
+                if direction_filter == "LONG_ONLY" and signal["action"] == "SELL":
+                    continue
+                if direction_filter == "SHORT_ONLY" and signal["action"] == "BUY":
+                    continue
 
-                    # Bug fix #2: entry price from the signal candle (iloc[-2]),
-                    # matching the live bot which also uses iloc[-2] close.
-                    # Previously used iloc[-1] (the forming candle) — wrong.
-                    entry_price = float(df_slice.iloc[-1]["Close"])
-                    quantity    = calculate_quantity(entry_price, scale=signal.get("quantity_scale", 1.0))
-                    if quantity < 1:
-                        continue   # Bug fix #4: was `break` — skipped ALL strategies
-                                   # for this symbol; changed to `continue` so the
-                                   # next strategy is still evaluated.
+                entry_price = float(df_slice.iloc[-1]["Close"])
+                quantity    = calculate_quantity(entry_price, scale=signal.get("quantity_scale", 1.0))
+                if quantity < 1:
+                    continue
 
-                    open_positions[symbol] = BtPosition(
-                        symbol        = symbol,
-                        direction     = signal["action"],
-                        entry_price   = entry_price,
-                        sl            = signal["sl"],
-                        target        = signal["target"],
-                        quantity      = quantity,
-                        entry_time    = ts_str,
-                        strategy_name = get_strategy_name(strategy_module),
-                    )
-                    break   # one position per symbol per loop tick
+                open_positions[symbol] = BtPosition(
+                    symbol             = symbol,
+                    direction          = signal["action"],
+                    entry_price        = entry_price,
+                    sl                 = signal["sl"],
+                    target             = signal["target"],
+                    quantity           = quantity,
+                    entry_time         = ts_str,
+                    strategy_name      = "ORB",
+                    orb_breakout_level = signal.get("orb_breakout_level", 0.0),
+                    window             = signal.get("window", "15m"),
+                )
+                break   # one position per symbol per loop tick
 
     return trades
 
@@ -473,16 +424,13 @@ def simulate_day(
 # Reporting
 # ---------------------------------------------------------------------------
 def print_overall_summary(
-    all_trades:     list[BtTrade],
-    days_tested:    int,
-    strategy_label: str,
-    universe:       list,
-    top_n:          int,
-    max_pos:        int,
+    all_trades:  list[BtTrade],
+    days_tested: int,
+    use_regime:  bool,
 ) -> None:
     sep = "=" * 70
     print(f"\n{sep}")
-    print(f"  BACKTEST SUMMARY — Strategy: {strategy_label}")
+    print("  BACKTEST SUMMARY — ORB v2 (Dual-Window 15m + 30m)")
     print(sep)
 
     if not all_trades:
@@ -496,43 +444,49 @@ def print_overall_summary(
     net       = gross - brokerage
     wins      = [t for t in all_trades if t.pnl_inr > 0]
     win_rate  = len(wins) / total * 100
+    avg_day   = net / days_tested if days_tested else 0
 
     by_reason: dict[str, int] = {}
     for t in all_trades:
         by_reason[t.exit_reason] = by_reason.get(t.exit_reason, 0) + 1
 
-    by_strategy: dict[str, list] = {}
+    by_window: dict[str, list] = {}
     for t in all_trades:
-        by_strategy.setdefault(t.strategy, []).append(t)
+        by_window.setdefault(t.window, []).append(t)
 
     best  = max(all_trades, key=lambda t: t.pnl_inr)
     worst = min(all_trades, key=lambda t: t.pnl_inr)
-    avg_per_day = net / days_tested if days_tested else 0
 
     print(f"  Backtest period  : {days_tested} trading days")
-    print(f"  Universe         : {len(universe)} stocks (top {top_n}/day by ATR%)")
-    print(f"  Capital per trade: Rs{POSITION_SIZE_INR:,.0f} (max {max_pos} simultaneous)")
+    print(f"  Universe         : {len(ORB_STOCK_UNIVERSE)} stocks (top {ORB_TOP_N_STOCKS}/day by ATR%)")
+    print(f"  Capital per trade: Rs{POSITION_SIZE_INR:,.0f} × scale (max {ORB_MAX_POSITIONS} simultaneous)")
+    print(f"  Regime filter    : {'ON' if use_regime else 'OFF'}")
     print(sep)
-    print(f"  Total trades     : {total}")
+    print(f"  Total trades     : {total}  ({total/days_tested:.1f}/day avg)")
     print(f"  Win rate         : {len(wins)}/{total} = {win_rate:.1f}%")
     print(f"  Exit breakdown   : {by_reason}")
     print(sep)
 
-    # Per-strategy breakdown
-    for strat, strat_trades in by_strategy.items():
-        s_wins = sum(1 for t in strat_trades if t.pnl_inr > 0)
-        s_wr   = s_wins / len(strat_trades) * 100
-        s_pnl  = sum(t.pnl_inr for t in strat_trades)
-        print(f"  [{strat}] trades={len(strat_trades)} wins={s_wins} ({s_wr:.0f}%) gross=Rs{s_pnl:+,.0f}")
+    # Per-window breakdown
+    for win_label in sorted(by_window.keys()):
+        wt      = by_window[win_label]
+        w_wins  = sum(1 for t in wt if t.pnl_inr > 0)
+        w_wr    = w_wins / len(wt) * 100
+        w_gross = sum(t.pnl_inr for t in wt)
+        w_net   = w_gross - BROKERAGE * len(wt)
+        print(
+            f"  [ORB-{win_label}] trades={len(wt)} wins={w_wins} ({w_wr:.0f}%) "
+            f"gross=Rs{w_gross:+,.0f}  net=Rs{w_net:+,.0f}"
+        )
 
     print(sep)
     print(f"  Gross P&L        : Rs{gross:+,.0f}")
     print(f"  Brokerage (est.) : -Rs{brokerage:,.0f}  (Rs{BROKERAGE}/trade × {total})")
     print(f"  Net P&L (est.)   : Rs{net:+,.0f}")
-    print(f"  Avg net/day      : Rs{avg_per_day:+,.0f}")
+    print(f"  Avg net/day      : Rs{avg_day:+,.0f}")
     print(sep)
-    print(f"  Best  : {best.symbol} {best.direction} {best.date} Rs{best.pnl_inr:+,.0f} [{best.exit_reason}]")
-    print(f"  Worst : {worst.symbol} {worst.direction} {worst.date} Rs{worst.pnl_inr:+,.0f} [{worst.exit_reason}]")
+    print(f"  Best  : {best.symbol} [{best.window}] {best.direction} {best.date} Rs{best.pnl_inr:+,.0f} [{best.exit_reason}]")
+    print(f"  Worst : {worst.symbol} [{worst.window}] {worst.direction} {worst.date} Rs{worst.pnl_inr:+,.0f} [{worst.exit_reason}]")
     print(sep)
 
 
@@ -546,7 +500,7 @@ def save_to_csv(all_trades: list[BtTrade]) -> None:
             writer.writerow({
                 "date":        t.date,
                 "symbol":      t.symbol,
-                "strategy":    t.strategy,
+                "window":      t.window,
                 "direction":   t.direction,
                 "entry_time":  t.entry_time,
                 "exit_time":   t.exit_time,
@@ -562,31 +516,18 @@ def save_to_csv(all_trades: list[BtTrade]) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def run(days: int, strategy_override: str | None = None) -> None:
-    import os
-    if strategy_override:
-        os.environ["ACTIVE_STRATEGY"] = strategy_override
-
-    strategies     = get_strategies()
-    strategy_label = " + ".join(get_strategy_name(s) for s in strategies)
-
-    # Resolve universe, top_n and max_positions based on active strategy
-    active = os.environ.get("ACTIVE_STRATEGY", ACTIVE_STRATEGY).upper()
-    is_orb = (active == "ORB")
-    bt_universe      = ORB_STOCK_UNIVERSE if is_orb else STOCK_UNIVERSE
-    bt_top_n         = ORB_TOP_N_STOCKS   if is_orb else TOP_N_STOCKS
-    bt_max_positions = ORB_MAX_POSITIONS  if is_orb else MAX_POSITIONS
-
+def run(days: int, use_regime: bool = False) -> None:
     print(f"\n{'=' * 70}")
-    print(f"  INTRADAY BACKTEST — last {days} trading days")
-    print(f"  Strategy : {strategy_label}")
-    print(f"  Universe : {bt_universe}")
+    print(f"  ORB v2 BACKTEST — last {days} trading days")
+    print(f"  Universe : {len(ORB_STOCK_UNIVERSE)} stocks → top {ORB_TOP_N_STOCKS}/day by ATR%")
+    print(f"  Windows  : 15-min ORB (primary) + 30-min ORB (secondary)")
+    print(f"  Regime   : {'NIFTY filter ON' if use_regime else 'OFF (use --regime to enable)'}")
     print(f"{'=' * 70}\n")
 
     # 1. Fetch data + indicators
-    logger.info("Fetching 59-day 2-min data (this may take ~1 minute)...")
+    logger.info("Fetching 59-day 2-min data (this may take ~2 minutes for 55 stocks)...")
     symbol_dfs: dict[str, pd.DataFrame] = {}
-    for symbol in bt_universe:
+    for symbol in ORB_STOCK_UNIVERSE:
         df = fetch_with_indicators(symbol)
         if df is not None:
             symbol_dfs[symbol] = df
@@ -596,90 +537,97 @@ def run(days: int, strategy_override: str | None = None) -> None:
         return
 
     # 2. Determine trading days
-    all_dates = sorted({d for df in symbol_dfs.values() for d in df.index.date})
+    all_dates      = sorted({d for df in symbol_dfs.values() for d in df.index.date})
     backtest_dates = all_dates[-days:]
     logger.info(f"Testing {len(backtest_dates)} days: {backtest_dates[0]} — {backtest_dates[-1]}")
 
-    # 2b. NIFTY regime filter (ORB only, opt-in via ORB_REGIME_FILTER=true)
-    import os as _os
-    use_regime = _os.getenv("ORB_REGIME_FILTER", "false").lower() == "true" and is_orb
-    day_regimes: dict = {}   # date → {"regime": str, "score": float, "direction_filter": str}
-
+    # 2b. NIFTY regime filter (optional, --regime flag)
+    day_regimes: dict = {}
     if use_regime:
-        logger.info("ORB_REGIME_FILTER=true — fetching NIFTY50 data for daily regime classification...")
+        logger.info("Fetching NIFTY50 data for daily regime classification...")
         nifty_df = fetch_nifty_with_indicators()
         if nifty_df is not None:
             for d in backtest_dates:
                 day_regimes[d] = compute_day_regime(nifty_df, d)
-            regime_counts: dict[str, int] = {}
+            counts: dict[str, int] = {}
             for r in day_regimes.values():
                 lbl = r.get("regime", "NEUTRAL")
-                regime_counts[lbl] = regime_counts.get(lbl, 0) + 1
-            logger.info(f"Regime classification over {len(backtest_dates)} days: {regime_counts}")
-            print(f"\n  Regime filter ON — NIFTY classification at 10:00 IST: {regime_counts}")
-            print(f"  BULL → LONG_ONLY  |  BEAR → SHORT_ONLY  |  NEUTRAL → BOTH")
+                counts[lbl] = counts.get(lbl, 0) + 1
+            logger.info(f"Regime classification: {counts}")
+            print(f"\n  Regime at 10:00 IST: {counts}")
+            print(f"  BULL → LONG_ONLY  |  BEAR → SHORT_ONLY  |  NEUTRAL → BOTH\n")
         else:
-            logger.warning("NIFTY fetch failed — regime filter disabled, all days use BOTH")
+            logger.warning("NIFTY fetch failed — proceeding without regime filter")
             use_regime = False
 
-    # 3. Simulate
+    # 3. Simulate day by day
     all_trades: list[BtTrade] = []
+
     if use_regime:
-        print(f"\n  {'Date':12s}  {'Rgm':>4}  {'Trades':>6}  {'Wins':>4}  {'Losses':>6}  {'Win%':>5}  {'Gross':>12}  {'Net':>12}")
-        print(f"  {'-' * 84}")
+        hdr = f"  {'Date':12s}  {'Rgm':>4}  {'15m':>4}  {'30m':>4}  {'Trades':>6}  {'Win%':>5}  {'Gross':>12}  {'Net':>12}"
     else:
-        print(f"\n  {'Date':12s}  {'Trades':>6}  {'Wins':>4}  {'Losses':>6}  {'Win%':>5}  {'Gross':>12}  {'Net':>12}")
-        print(f"  {'-' * 78}")
+        hdr = f"  {'Date':12s}  {'15m':>4}  {'30m':>4}  {'Trades':>6}  {'Win%':>5}  {'Gross':>12}  {'Net':>12}"
+    print(hdr)
+    print(f"  {'-' * (len(hdr) - 2)}")
 
     for date_ in backtest_dates:
-        regime         = day_regimes.get(date_, {"regime": "BOTH", "direction_filter": "BOTH"})
-        dir_filter     = regime.get("direction_filter", "BOTH")
-        regime_label   = regime.get("regime", "BOTH")[:4]   # BULL / BEAR / NEUT / BOTH
+        regime_info  = day_regimes.get(date_, {"regime": "BOTH", "direction_filter": "BOTH", "score": 0.0})
+        dir_filter   = regime_info.get("direction_filter", "BOTH")
+        regime_label = regime_info.get("regime", "BOTH")[:4]
 
-        candidates  = rank_by_atr(symbol_dfs, date_, top_n=bt_top_n)
+        effective_max = ORB_MAX_POSITIONS
+        if use_regime:
+            from config import REGIME_BEAR_MAX_POSITIONS, REGIME_NEUTRAL_MAX_POSITIONS
+            if regime_info.get("regime") == "BEAR":
+                effective_max = REGIME_BEAR_MAX_POSITIONS
+            elif regime_info.get("regime") == "NEUTRAL":
+                effective_max = REGIME_NEUTRAL_MAX_POSITIONS
+
+        candidates = rank_by_atr(symbol_dfs, date_, top_n=ORB_TOP_N_STOCKS)
         day_trades  = simulate_day(
-            date_, candidates, symbol_dfs, strategies,
-            max_positions=bt_max_positions,
+            date_, candidates, symbol_dfs,
+            max_positions=effective_max,
             direction_filter=dir_filter,
         )
         all_trades.extend(day_trades)
 
         if day_trades:
-            g    = sum(t.pnl_inr for t in day_trades)
-            n    = g - BROKERAGE * len(day_trades)
-            wins = sum(1 for t in day_trades if t.pnl_inr > 0)
-            wr   = wins / len(day_trades) * 100
+            g     = sum(t.pnl_inr for t in day_trades)
+            n     = g - BROKERAGE * len(day_trades)
+            wins  = sum(1 for t in day_trades if t.pnl_inr > 0)
+            wr    = wins / len(day_trades) * 100
+            c15   = sum(1 for t in day_trades if t.window == "15m")
+            c30   = sum(1 for t in day_trades if t.window == "30m")
             if use_regime:
                 print(
-                    f"  {str(date_):12s}  {regime_label:>4s}  {len(day_trades):>6d}  {wins:>4d}  "
-                    f"{len(day_trades)-wins:>6d}  {wr:>4.0f}%  "
-                    f"Rs{g:>+9,.0f}  Rs{n:>+9,.0f}"
+                    f"  {str(date_):12s}  {regime_label:>4s}  {c15:>4d}  {c30:>4d}  "
+                    f"{len(day_trades):>6d}  {wr:>4.0f}%  Rs{g:>+9,.0f}  Rs{n:>+9,.0f}"
                 )
             else:
                 print(
-                    f"  {str(date_):12s}  {len(day_trades):>6d}  {wins:>4d}  "
-                    f"{len(day_trades)-wins:>6d}  {wr:>4.0f}%  "
-                    f"Rs{g:>+9,.0f}  Rs{n:>+9,.0f}"
+                    f"  {str(date_):12s}  {c15:>4d}  {c30:>4d}  "
+                    f"{len(day_trades):>6d}  {wr:>4.0f}%  Rs{g:>+9,.0f}  Rs{n:>+9,.0f}"
                 )
         else:
             if use_regime:
-                print(f"  {str(date_):12s}  {regime_label:>4s}  {'—':>6}  {'—':>4}  {'—':>6}  {'—':>5}  {'Rs0':>12}  {'Rs0':>12}")
+                print(f"  {str(date_):12s}  {regime_label:>4s}  {'—':>4}  {'—':>4}  {'—':>6}  {'—':>5}  {'Rs0':>12}  {'Rs0':>12}")
             else:
-                print(f"  {str(date_):12s}  {'—':>6}  {'—':>4}  {'—':>6}  {'—':>5}  {'Rs0':>12}  {'Rs0':>12}")
+                print(f"  {str(date_):12s}  {'—':>4}  {'—':>4}  {'—':>6}  {'—':>5}  {'Rs0':>12}  {'Rs0':>12}")
 
     # 4. Summary + CSV
-    print_overall_summary(
-        all_trades, len(backtest_dates), strategy_label,
-        universe=bt_universe, top_n=bt_top_n, max_pos=bt_max_positions,
-    )
+    print_overall_summary(all_trades, len(backtest_dates), use_regime)
     save_to_csv(all_trades)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backtest multi-strategy intraday bot")
-    parser.add_argument("--days", type=int, default=30, choices=range(1, 60), metavar="N",
-                        help="Trading days to backtest (1–59, default: 30)")
-    parser.add_argument("--strategy", type=str, default=None,
-                        help="Override ACTIVE_STRATEGY: ORB | VWAP_EMA | COMBINED")
+    parser = argparse.ArgumentParser(description="Backtest ORB v2 dual-window strategy")
+    parser.add_argument(
+        "--days", type=int, default=30, choices=range(1, 60), metavar="N",
+        help="Trading days to backtest (1–59, default: 30)",
+    )
+    parser.add_argument(
+        "--regime", action="store_true",
+        help="Enable NIFTY50 regime filter (LONG_ONLY on BULL days, SHORT_ONLY on BEAR days)",
+    )
     args = parser.parse_args()
-    run(args.days, args.strategy)
+    run(args.days, use_regime=args.regime)

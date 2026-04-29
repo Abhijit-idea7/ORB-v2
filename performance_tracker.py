@@ -2,9 +2,7 @@
 performance_tracker.py
 ----------------------
 Records every closed trade, computes daily P&L, and appends to
-performance_log.csv which GitHub Actions commits back to the repo.
-
-Extended from the original to include strategy_name in trade records and CSV.
+performance_log_ORB.csv which GitHub Actions commits back to the repo.
 """
 
 import csv
@@ -17,10 +15,10 @@ import pytz
 
 logger   = logging.getLogger(__name__)
 IST      = pytz.timezone("Asia/Kolkata")
-_DEFAULT_LOG_FILE = Path("performance_log.csv")
+_DEFAULT_LOG_FILE = Path("performance_log_ORB.csv")
 
 CSV_FIELDS = [
-    "date", "symbol", "strategy",
+    "date", "symbol", "window",
     "direction", "entry_time", "exit_time",
     "entry_price", "exit_price", "quantity",
     "pnl_inr", "exit_reason",
@@ -31,15 +29,15 @@ CSV_FIELDS = [
 class TradeRecord:
     date:        str
     symbol:      str
-    strategy:    str    # which strategy opened this trade
-    direction:   str    # "BUY" or "SELL"
+    window:      str    # "15m" or "30m" — which ORB window fired
+    direction:   str
     entry_time:  str
     exit_time:   str
     entry_price: float
     exit_price:  float
     quantity:    int
     pnl_inr:     float
-    exit_reason: str    # TARGET | STOP_LOSS | ORB_FAILED | EMA_REVERSAL | SQUARE_OFF
+    exit_reason: str
 
 
 class PerformanceTracker:
@@ -56,11 +54,10 @@ class PerformanceTracker:
         quantity:    int,
         entry_time:  str,
         exit_reason: str,
-        strategy:    str = "UNKNOWN",
+        window:      str = "15m",
     ) -> TradeRecord:
         now      = datetime.now(IST)
         exit_time = now.strftime("%H:%M")
-
         pnl = (
             (exit_price - entry_price) * quantity
             if direction == "BUY"
@@ -71,7 +68,7 @@ class PerformanceTracker:
         record = TradeRecord(
             date        = now.strftime("%Y-%m-%d"),
             symbol      = symbol,
-            strategy    = strategy,
+            window      = window,
             direction   = direction,
             entry_time  = entry_time,
             exit_time   = exit_time,
@@ -83,16 +80,16 @@ class PerformanceTracker:
         )
         self.trades.append(record)
 
-        emoji = "+" if pnl >= 0 else "-"
+        sign = "+" if pnl >= 0 else "-"
         logger.info(
-            f"[PERF] [{emoji}] {strategy} | {direction} {symbol} | "
+            f"[PERF] [{sign}] ORB/{window} | {direction} {symbol} | "
             f"entry={entry_price:.2f} exit={exit_price:.2f} qty={quantity} | "
             f"P&L=Rs{pnl:+,.0f} | reason={exit_reason}"
         )
         return record
 
     def daily_summary(self) -> None:
-        sep = "=" * 60
+        sep = "=" * 65
         logger.info(f"[PERF] {sep}")
 
         if not self.trades:
@@ -102,43 +99,38 @@ class PerformanceTracker:
 
         total      = len(self.trades)
         profitable = [t for t in self.trades if t.pnl_inr > 0]
-        losses     = [t for t in self.trades if t.pnl_inr <= 0]
         gross_pnl  = sum(t.pnl_inr for t in self.trades)
-        brokerage  = total * 40   # Zerodha intraday: Rs20/order × 2 legs
+        brokerage  = total * 40   # Rs20/order × 2 legs
         net_pnl    = gross_pnl - brokerage
         win_rate   = len(profitable) / total * 100
         best       = max(self.trades, key=lambda t: t.pnl_inr)
         worst      = min(self.trades, key=lambda t: t.pnl_inr)
 
-        # Per-strategy breakdown
-        by_strategy: dict[str, list] = {}
+        by_window: dict[str, list] = {}
         for t in self.trades:
-            by_strategy.setdefault(t.strategy, []).append(t)
+            by_window.setdefault(t.window, []).append(t)
 
-        # Per exit-reason breakdown
         by_reason: dict[str, int] = {}
         for t in self.trades:
             by_reason[t.exit_reason] = by_reason.get(t.exit_reason, 0) + 1
 
         lines = [
-            f"DAILY PERFORMANCE — {self.trades[0].date}",
+            f"ORB DAILY PERFORMANCE — {self.trades[0].date}",
             sep,
-            f"  Total trades      : {total}",
-            f"  Profitable        : {len(profitable)}  ({win_rate:.1f}% win rate)",
-            f"  Loss-making       : {len(losses)}",
-            f"  Exit breakdown    : {by_reason}",
+            f"  Total trades : {total}",
+            f"  Winners      : {len(profitable)}  ({win_rate:.1f}% win rate)",
+            f"  Losers       : {total - len(profitable)}",
+            f"  Exit reasons : {by_reason}",
             sep,
         ]
 
-        # Per-strategy summary
-        for strat, strat_trades in by_strategy.items():
-            strat_pnl  = sum(t.pnl_inr for t in strat_trades)
-            strat_wins = sum(1 for t in strat_trades if t.pnl_inr > 0)
-            strat_wr   = strat_wins / len(strat_trades) * 100
+        for win_label, win_trades in sorted(by_window.items()):
+            w_pnl  = sum(t.pnl_inr for t in win_trades)
+            w_wins = sum(1 for t in win_trades if t.pnl_inr > 0)
+            w_wr   = w_wins / len(win_trades) * 100
             lines.append(
-                f"  [{strat}] trades={len(strat_trades)} "
-                f"wins={strat_wins} ({strat_wr:.0f}%) "
-                f"gross=Rs{strat_pnl:+,.0f}"
+                f"  [ORB-{win_label}] trades={len(win_trades)} "
+                f"wins={w_wins} ({w_wr:.0f}%) gross=Rs{w_pnl:+,.0f}"
             )
 
         lines += [
@@ -147,8 +139,10 @@ class PerformanceTracker:
             f"  Brokerage (est.)  : -Rs{brokerage:,.0f}",
             f"  Net P&L (est.)    : Rs{net_pnl:+,.0f}",
             sep,
-            f"  Best  : {best.symbol} {best.direction} Rs{best.pnl_inr:+,.0f} ({best.exit_reason})",
-            f"  Worst : {worst.symbol} {worst.direction} Rs{worst.pnl_inr:+,.0f} ({worst.exit_reason})",
+            f"  Best  : {best.symbol} ({best.window}) {best.direction} "
+            f"Rs{best.pnl_inr:+,.0f} ({best.exit_reason})",
+            f"  Worst : {worst.symbol} ({worst.window}) {worst.direction} "
+            f"Rs{worst.pnl_inr:+,.0f} ({worst.exit_reason})",
             sep,
             "  TRADE BREAKDOWN:",
         ]
@@ -156,7 +150,7 @@ class PerformanceTracker:
         for t in self.trades:
             sign = "+" if t.pnl_inr >= 0 else "-"
             lines.append(
-                f"    [{sign}] {t.symbol:12s} [{t.strategy:8s}] {t.direction:4s} "
+                f"    [{sign}] {t.symbol:12s} [{t.window}] {t.direction:4s} "
                 f"{t.entry_time}->{t.exit_time}  "
                 f"Rs{t.entry_price:.2f}->Rs{t.exit_price:.2f}  "
                 f"qty={t.quantity}  P&L=Rs{t.pnl_inr:+,.0f}  [{t.exit_reason}]"
@@ -180,7 +174,7 @@ class PerformanceTracker:
                 writer.writerow({
                     "date":        t.date,
                     "symbol":      t.symbol,
-                    "strategy":    t.strategy,
+                    "window":      t.window,
                     "direction":   t.direction,
                     "entry_time":  t.entry_time,
                     "exit_time":   t.exit_time,
