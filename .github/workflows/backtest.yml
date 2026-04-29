@@ -30,6 +30,10 @@ on:
         description: "Enable NIFTY regime filter? (true / false)"
         required: false
         default: "true"
+      position_size:
+        description: "Capital per trade in INR (e.g. 150000)"
+        required: false
+        default: "150000"
 
 jobs:
   backtest:
@@ -54,15 +58,18 @@ jobs:
         env:
           STOCKSDEVELOPER_API_KEY: "backtest_mode"
           STOCKSDEVELOPER_ACCOUNT: "backtest_mode"
+          POSITION_SIZE_INR: ${{ github.event.inputs.position_size }}
         run: |
           DAYS="${{ github.event.inputs.days }}"
           REGIME="${{ github.event.inputs.regime }}"
+          SIZE="${{ github.event.inputs.position_size }}"
           echo "============================================"
           echo "  ORB v2 Backtest"
-          echo "  Days   : $DAYS"
-          echo "  Regime : $REGIME"
-          echo "  Universe: 55 stocks, top 25/day by ATR%"
-          echo "  Windows : 15-min ORB + 30-min ORB"
+          echo "  Days          : $DAYS"
+          echo "  Regime        : $REGIME"
+          echo "  Position size : Rs${SIZE}/trade"
+          echo "  Universe      : 55 stocks, top 25/day by ATR%"
+          echo "  Window        : 15-min ORB"
           echo "============================================"
           if [ "$REGIME" = "true" ]; then
             python backtest.py --days "$DAYS" --regime
