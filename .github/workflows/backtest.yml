@@ -1,25 +1,40 @@
-name: Backtest Strategy
+name: ORB v2 — Backtest
+
+# -----------------------------------------------------------------------
+# Run the dual-window ORB backtest on demand.
+#
+# HOW TO RUN:
+#   GitHub → Actions → "ORB v2 — Backtest" → "Run workflow"
+#   Fill in the inputs and click the green button.
+#
+# INPUTS:
+#   days   : How many trading days to backtest (1–59, default 30)
+#             Yahoo Finance gives max ~59 days of 2-min candle history.
+#   regime : Enable NIFTY50 regime filter (LONG_ONLY on BULL days,
+#             SHORT_ONLY on BEAR days). Recommended: true.
+#
+# OUTPUT:
+#   • Printed per-day table in the Actions log (Gross / Net / Win%)
+#   • Per-window breakdown: how many trades came from 15-min vs 30-min ORB
+#   • backtest_results.csv saved as a downloadable Actions artifact
+# -----------------------------------------------------------------------
 
 on:
   workflow_dispatch:
     inputs:
-      strategy:
-        description: "Strategy to backtest (ORB / VWAP_EMA / COMBINED)"
-        required: true
-        default: "ORB"
       days:
-        description: "Number of past trading days (1–59)"
+        description: "Trading days to backtest (1–59)"
         required: false
         default: "30"
+      regime:
+        description: "Enable NIFTY regime filter? (true / false)"
+        required: false
+        default: "true"
 
 jobs:
   backtest:
-    name: Run Backtest
+    name: ORB v2 Backtest — ${{ github.event.inputs.days }} days
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-    # Backtest fetches data and simulates; 30 min is usually plenty
     timeout-minutes: 30
 
     steps:
@@ -35,23 +50,30 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Backtest doesn't place real orders — no webhook secrets needed.
-      # STOCKSDEVELOPER_API_KEY is still required by config.py import, so we
-      # pass a dummy value. Backtest never calls order_manager functions.
       - name: Run backtest
         env:
-          STOCKSDEVELOPER_API_KEY: "backtest-dummy-key"
-          STOCKSDEVELOPER_ACCOUNT: "backtest"
-          ACTIVE_STRATEGY: ${{ github.event.inputs.strategy }}
+          STOCKSDEVELOPER_API_KEY: "backtest_mode"
+          STOCKSDEVELOPER_ACCOUNT: "backtest_mode"
         run: |
-          python backtest.py \
-            --strategy "${{ github.event.inputs.strategy }}" \
-            --days "${{ github.event.inputs.days }}"
+          DAYS="${{ github.event.inputs.days }}"
+          REGIME="${{ github.event.inputs.regime }}"
+          echo "============================================"
+          echo "  ORB v2 Backtest"
+          echo "  Days   : $DAYS"
+          echo "  Regime : $REGIME"
+          echo "  Universe: 55 stocks, top 25/day by ATR%"
+          echo "  Windows : 15-min ORB + 30-min ORB"
+          echo "============================================"
+          if [ "$REGIME" = "true" ]; then
+            python backtest.py --days "$DAYS" --regime
+          else
+            python backtest.py --days "$DAYS"
+          fi
 
-      # Upload results CSV as downloadable artifact
       - name: Upload backtest results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-${{ github.event.inputs.strategy }}-${{ github.event.inputs.days }}d
+          name: backtest-results-${{ github.event.inputs.days }}d
           path: backtest_results.csv
           retention-days: 30
